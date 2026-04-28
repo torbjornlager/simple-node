@@ -1,6 +1,6 @@
 :- module(rpc,
-       [ rpc/2,                  % +URI, :Goal
-         rpc/3                   % +URI, :Goal, +Options
+       [ rpc/2,                  % +URI, +Goal
+         rpc/3                   % +URI, +Goal, +Options
        ]).
 
 /** <module> RPC -- simple HTTP-based remote Prolog calls
@@ -42,12 +42,8 @@ X = b.
 :- use_module(library(option)).
 
 
-:- meta_predicate(rpc(+, 0)).
-:- meta_predicate(rpc(+, 0, +)).
-
-
-%!  rpc(+URI, :Goal) is nondet.
-%!  rpc(+URI, :Goal, +Options) is nondet.
+%!  rpc(+URI, +Goal) is nondet.
+%!  rpc(+URI, +Goal, +Options) is nondet.
 %
 %   Call Goal against the node identified by URI. Solutions are returned
 %   to the caller one at a time on backtracking. Options:
@@ -61,7 +57,8 @@ X = b.
 rpc(URI, Goal) :-
     rpc(URI, Goal, []).
 
-rpc(URI, Goal, Options) :-
+rpc(URI, Goal0, Options) :-
+    strip_module(Goal0, _, Goal),
     parse_url(URI, Parts),
     term_variables(Goal, Vars),
     Template =.. [v|Vars],
