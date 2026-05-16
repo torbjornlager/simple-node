@@ -9,6 +9,7 @@
        toplevel_abort/1
    ]).
 :- use_module(node, []).
+:- use_module(node_engines, []).
 :- use_module(rpc, [
        rpc/2,
        rpc/3
@@ -29,6 +30,7 @@ t :-
                actors,
                toplevels,
                node,
+               node_engines,
                rpc,
                programs,
                parallel
@@ -403,6 +405,63 @@ test(node_json_not_implemented_message,
                   node:respond_with_answer(json, success([], false))).
 
 :- end_tests(node).
+
+
+:- begin_tests(node_engines).
+
+test(node_engines_compute_answer_single_slice,
+     Answer == success([1,2,3], false)) :-
+   setup_call_cleanup(
+       retractall(node_engines:cache(_, _, _)),
+       node_engines:compute_answer(between(1,3,N), N, 0, 10, Answer),
+       retractall(node_engines:cache(_, _, _))
+   ).
+
+test(node_engines_compute_answer_cached_paging,
+     Answers == [success([1,2], true), success([3,4,5], true), success([6], false)]) :-
+   setup_call_cleanup(
+       retractall(node_engines:cache(_, _, _)),
+       (
+           node_engines:compute_answer(between(1,6,N), N, 0, 2, Answer1),
+           node_engines:compute_answer(between(1,6,N), N, 2, 3, Answer2),
+           node_engines:compute_answer(between(1,6,N), N, 5, 1, Answer3),
+           Answers = [Answer1, Answer2, Answer3]
+       ),
+       retractall(node_engines:cache(_, _, _))
+   ).
+
+test(node_engines_no_lookahead_side_effects,
+     Observed == [success([a], true)-[a], success([b], false)-[a,b]]) :-
+   setup_call_cleanup(
+       (
+           retractall(node_engines:cache(_, _, _)),
+           retractall(node_engines:node_engines_seen(_))
+       ),
+       (
+           node_engines:compute_answer(
+               (assertz(node_engines_seen(a)), X = a ;
+                assertz(node_engines_seen(b)), X = b),
+               X, 0, 1, Answer1),
+           findall(S1, node_engines:node_engines_seen(S1), Seen1),
+           node_engines:compute_answer(
+               (assertz(node_engines_seen(a)), X = a ;
+                assertz(node_engines_seen(b)), X = b),
+               X, 1, 1, Answer2),
+           findall(S2, node_engines:node_engines_seen(S2), Seen2),
+           Observed = [Answer1-Seen1, Answer2-Seen2]
+       ),
+       (
+           retractall(node_engines:cache(_, _, _)),
+           retractall(node_engines:node_engines_seen(_))
+       )
+   ).
+
+test(node_engines_json_not_implemented_message,
+     Output == "Content-type: text/plain; charset=UTF-8\n\nJSON output is not yet implemented\nUse format=prolog\n") :-
+   with_output_to(string(Output),
+                  node_engines:respond_with_answer(json, success([], false))).
+
+:- end_tests(node_engines).
 
 
 :- begin_tests(rpc).
