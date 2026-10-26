@@ -1,124 +1,98 @@
-# A simple Web Prolog proof of concept
+# A simple Web Prolog node
 
-This directory contains a small proof-of-concept implementation of Web
-Prolog, written to make the core ideas easy to read and easy to port.
-It is intentionally smaller than the more complete Trinity codebase.
+A runnable companion to the implementation appendix of the
+[Trinity book](https://trinity.elfenbenstornet.se/book.html). The code keeps
+actors, toplevel processes, stateless HTTP calls, and continuation caching
+small enough to read together. The Trinity homepage links here under
+[“A simple node”](https://trinity.elfenbenstornet.se/pocs.html).
 
-The current PoC consists of:
+- `actors.pl`: local actors, selective receive, guards, links, and monitors
+- `toplevel_actors.pl`: resumable solution slices and toplevel control
+- `node.pl`: a loopback HTTP endpoint with a bounded continuation cache
+- `rpc.pl`: a nondeterministic HTTP client
+- `term_wire.pl`: character-list text, portable terms, and canonical keys
+- `tests.pl` and `regression_tests.pl`: actor, HTTP, RPC, and cleanup checks
+- `parallel.pl`: small parallel actor examples
 
-- `actors.pl` for Erlang-style actor primitives
-- `toplevel_actors.pl` for shell-style toplevel processes
-- `node.pl` for a small stateless HTTP API
-- `rpc.pl` for client-side HTTP RPC
-- `tests.pl` for the regression suite
+This teaching implementation runs trusted goals with the authority of its
+SWI-Prolog process. Actors share host modules and the clause database. It
+has no authentication, sandbox, private actor databases, distributed actor
+transport, `node` or `load_*` spawn options, source installation, or JSON
+answers. It does not claim conformance to a complete Web Prolog profile.
+Use the [full node](https://github.com/torbjornlager/swi-prolog-node) for
+those mechanisms. Keep this example on a trusted local machine.
 
-The implementation is deliberately incomplete. In particular, it does
-not implement the `node` option or the `load_*` options.
+## Requirements and tests
 
-## Requirements
+Use a recent threaded SWI-Prolog with `sig_atomic/1` and `findnsols/4`.
+The suite has been checked with SWI-Prolog 10.1.18 on macOS, including the
+standard application distribution. From this repository:
 
-Install a recent [SWI-Prolog](https://www.swi-prolog.org/download/devel)
-for your platform.
-
-## Running the tests
-
-From this directory:
-
-```text
-$ cd simple-node
-$ swipl
+```sh
+swipl -q -s tests.pl -g '(t -> halt(0); halt(1)).'
 ```
 
-Then:
+Alternatively, load `[tests].` in the Prolog shell and call `t.`. The suite
+includes real HTTP requests and checks text decoding, literal `'$VAR'/1`
+data, variable sharing, changed page sizes, pending errors after partial
+pages, absence of lookahead, eviction, and interruption cleanup.
 
-```prolog
-?- [tests].
-true.
+With `boken` cloned beside this repository, the printed appendix listings
+can also be extracted and tested directly:
 
-?- t.
+```sh
+python3 ../boken/author/companions/implementation/check_examples.py
 ```
 
-All tests should pass.
+That script accepts `--swipl /path/to/swipl` and `--simple-node /path/to/simple-node`.
 
-You can also run the whole suite directly from the shell:
-
-```text
-$ swipl -q -g "['tests.pl'], t, halt."
-```
-
-## Running a node
-
-Start SWI-Prolog in this directory and load the node and RPC modules:
+## Run a node
 
 ```prolog
 ?- [node, rpc, toplevel_actors].
 true.
-```
-
-Then start a node on port `3010`:
-
-```prolog
 ?- node(3010).
 true.
 ```
 
-There is no startup banner at the moment, but the HTTP server is then
-running on `http://localhost:3010/`.
+The server binds to loopback. Run one node per Prolog process.
 
-**Warning:** do not expose this node to the public internet in its
-current form.
+[All answers](http://localhost:3010/call?goal=member(X,%5Ba,b%5D)&template=X)
+from `/call?goal=member(X,[a,b])&template=X`:
 
-## Trying the HTTP API
-
-The node currently only implements the `prolog` answer format. If you
-omit `format=prolog`, the default response is:
-
-```text
-JSON output is not yet implemented
-Use format=prolog
+```prolog
+success([a,b],false).
 ```
 
-Try this in a browser:
+Add `limit=1` to request the first page:
 
-[http://localhost:3010/call?goal=member(X,[a,b])&format=prolog](http://localhost:3010/call?goal=member(X,[a,b])&format=prolog)
-
-You should see:
-
-```text
-success([member(a,[a,b]),member(b,[a,b])],false).
-```
-
-Then try:
-
-[http://localhost:3010/call?goal=member(X,[a,b])&template=X&offset=0&limit=1&format=prolog](http://localhost:3010/call?goal=member(X,[a,b])&template=X&offset=0&limit=1&format=prolog)
-
-and you should get:
-
-```text
+```prolog
 success([a],true).
 ```
 
-Then try the same query with `offset=1`:
+Repeat with `offset=1&limit=1`:
 
-[http://localhost:3010/call?goal=member(X,[a,b])&template=X&offset=1&limit=1&format=prolog](http://localhost:3010/call?goal=member(X,[a,b])&template=X&offset=1&limit=1&format=prolog)
-
-which should give:
-
-```text
+```prolog
 success([b],false).
 ```
 
-## Trying `rpc/2-3`
+The default format is `prolog`, with content type `application/x-prolog`.
+Omitting `limit` collects all solutions. An explicit limit must be positive;
+`offset` must be nonnegative. Double-quoted HTTP input denotes character
+lists: `goal=X="ab"&template=X` returns `success([[a,b]],false).`
+Cyclic terms, attributed variables, native strings, and opaque host values
+are rejected at the answer boundary.
 
-With the node still running:
+Stop the server and reclaim cached workers with:
 
 ```prolog
-?- rpc('http://localhost:3010', member(X, [a,b])).
-X = a ;
-X = b.
+?- stop_node(3010).
+true.
 ```
 
-And:
+## Use RPC
+
+With the node running:
 
 ```prolog
 ?- rpc('http://localhost:3010', member(X, [a,b]), [limit(1)]).
@@ -126,53 +100,55 @@ X = a ;
 X = b.
 ```
 
-The point of the paged implementation is that it avoids spurious
-recomputation. For example:
+Goal and template serialization preserves quoted atoms, literal `'$VAR'/1`
+data, and variable sharing. For text in locally entered goals, use character
+lists such as `[a,b]`, or set the caller's `double_quotes` flag to `chars`.
+The HTTP parser applies `chars` independently of the caller's flag.
+
+Paging avoids recomputation while the matching continuation remains cached:
 
 ```prolog
-?- time(rpc('http://localhost:3010', (sleep(1), X=foo ; X=bar), [limit(1)])).
+?- rpc('http://localhost:3010', (sleep(1), X=foo ; X=bar), [limit(1)]).
 X = foo ;
 X = bar.
 ```
 
-The first answer should take about one second, while the second should
-arrive almost immediately because the node continues from a cached
-toplevel instead of recomputing the delayed first branch.
+The first answer takes about a second; the second resumes the suspended
+query. No extra solution is evaluated to decide `More`. A partial page
+followed by an exception is delivered before its pending error; the next
+offset advances by the actual page length.
 
-## Using the Prolog shell as a client
+The cache holds at most 100 suspended workers by default, and eviction
+terminates the worker. Requests own workers until they transfer them into
+the cache; timeout or interruption reclaims an untransferred worker.
+The page wait timeout defaults to 30 seconds. These settings are available
+through `library(settings)` as `node:cache_size` and `node:timeout`.
+Selective receive uses protected queue polls with sleeps outside the atomic
+step; this adds up to about 10 ms of receive latency. There is no idle expiry: abandoned queries remain until eviction,
+`node:clear_cache`, server shutdown through `stop_node/1`, or process exit.
 
-You can also use the ordinary Prolog toplevel as a shell for a toplevel
-actor:
+After eviction, the same request replays the goal from its offset. Pure
+goals with stable dependencies retain their answer sequence; changing data
+and side effects can behave differently. There is no snapshot or
+exactly-once guarantee.
+
+## Try a toplevel actor
 
 ```prolog
 ?- toplevel_spawn(Pid, [monitor(true)]).
 Pid = <thread>(...).
-
-?- toplevel_call($Pid, between(1,5,I), [
-       template(I),
-       limit(2)
-   ]).
-Pid = <thread>(...).
-
+?- toplevel_call($Pid, between(1,5,I), [template(I),limit(2)]).
+true.
 ?- flush.
 Shell got success(<thread>(...),[1,2],true)
 true.
-
 ?- toplevel_next($Pid, [limit(10)]).
-Pid = <thread>(...).
-
+true.
 ?- flush.
 Shell got success(<thread>(...),[3,4,5],false)
 Shell got down(<thread>(...),<thread>(...),true)
 true.
 ```
 
-Your actual thread identifiers will differ.
-
-## Not implemented
-
-Examples that currently do not work include:
-
-1. examples that use the `node` option
-2. examples that use the `load_*` options
-3. JSON answers from the HTTP API
+Thread identifiers differ between runs. Unlike the full node, this local
+actor example exposes host thread identifiers rather than wire-portable pids.

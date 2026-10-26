@@ -109,6 +109,8 @@ Answer = success(Pid, [3,4], true).
 
 :- use_module(actors).
 :- use_module(library(option)).
+:- use_module(term_wire).
+:- use_module(library(solution_sequences)).
 
 
 :- meta_predicate(toplevel_call(+, 0)).
@@ -155,27 +157,35 @@ toplevel_spawn(Pid, Options) :-
 % Note that findnsols/4 is a built-in predicate in SWI-Prolog. It is
 % very important in this implementation.
 
-slice(Goal, Template, Offset, Limit, Slice) :-
-    findnsols(Limit, Template, offset(Offset, Goal), Slice).
-
-
-% Turn one sliced execution step into a protocol-level answer term.
-
-answer(Goal, Template, Offset, Limit, Answer) :-
-    catch(
-        call_cleanup(slice(Goal, Template, Offset, Limit, Slice),
-                     Det = true),
-        Error, true),
-    (   Slice == []
-    ->  Answer = failure
-    ;   nonvar(Error)
-    ->  Answer = error(Error)
-    ;   var(Det)
-    ->  Answer = success(Slice, true)
-    ;   Det = true
-    ->  Answer = success(Slice, false)
+slice(Goal, Template, Offset, Limit, Partial, Slice) :-
+    arg(1, Limit, Size),
+    (   Size == unbounded
+    ->  findall(Template, (offset(Offset, Goal), portable_term(Template)), Slice)
+    ;   findnsols(Limit, Template,
+            (offset(Offset, Goal), portable_term(Template),
+             arg(1, Partial, Prior),
+             nb_setarg(1, Partial, [Template|Prior])), Slice)
     ).
-   
+
+% A partial page precedes its pending exception. Backtracking after '$next'
+% delivers the exception without restarting the goal or repeating effects.
+answer(Goal, Template, Offset, Limit, Answer) :-
+    Partial = collected([]),
+    catch(call_cleanup(slice(Goal, Template, Offset, Limit, Partial, Slice),
+                       Det = true), E,
+          (actors:control_exception(E) -> throw(E); Caught = caught(E))),
+    (   nonvar(Caught)
+    ->  Caught = caught(Error),
+        arg(1, Partial, Reversed), reverse(Reversed, Saved),
+        arg(1, Limit, Size),
+        (Size \== unbounded, Saved \== []
+        -> (Answer = success(Saved,true); safe_answer(error(Error),Answer))
+        ; safe_answer(error(Error),Answer))
+    ;   nb_setarg(1, Partial, []),
+        (Slice == [] -> Answer = failure
+        ; var(Det) -> Answer = success(Slice,true)
+        ; Answer = success(Slice,false))
+    ).
 
                 /*******************************
                 *      PTCP STATE MACHINE     *
@@ -198,11 +208,11 @@ state_1(Pid, Target0, Continue) :-
         '$call'(Goal, Options) ->
             option(template(Template), Options, Goal),
             option(offset(Offset), Options, 0),
-            option(limit(Limit0), Options, 10 000 000 000),
+            option(limit(Limit0), Options, unbounded),
             option(target(Target1), Options, Target0),
             Limit = count(Limit0),
-            state_2(Goal, Template, Offset, Limit, Pid, Answer),
             Target = target(Target1),
+            state_2(Goal, Template, Offset, Limit, Pid, Answer),
             arg(1, Target, Out),
             Out ! Answer,
             (   arg(3, Answer, true)
@@ -273,8 +283,9 @@ toplevel_call(Pid, Goal) :-
     toplevel_call(Pid, Goal, []).
 
 toplevel_call(Pid, Goal0, Options) :-
-    strip_module(Goal0, _, Goal),
-    Pid ! '$call'(Goal, Options).
+    strip_module(Goal0, Module, Goal),
+    select_option(template(Template), Options, Rest, Goal),
+    Pid ! '$call'(Module:Goal, [template(Template)|Rest]).
 
 
 %!  toplevel_next(+Pid) is det.

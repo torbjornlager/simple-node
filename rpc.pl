@@ -40,6 +40,7 @@ X = b.
 :- use_module(library(http/http_open)).
 :- use_module(library(url)).
 :- use_module(library(option)).
+:- use_module(term_wire).
 
 
 %!  rpc(+URI, +Goal) is nondet.
@@ -50,7 +51,7 @@ X = b.
 %
 %     - limit(+Positive)
 %       Maximum number of solutions to fetch in each HTTP request.
-%       Default: a very large number.
+%       Default: all solutions in one response.
 %
 %   Any additional options are passed to http_open/3.
 
@@ -59,38 +60,29 @@ rpc(URI, Goal) :-
 
 rpc(URI, Goal0, Options) :-
     strip_module(Goal0, _, Goal),
+    portable_term(Goal),
     parse_url(URI, Parts),
-    term_variables(Goal, Vars),
-    Template =.. [v|Vars],
-    format(atom(GoalAtom), "(~p)", [Goal]),
-    format(atom(TemplateAtom), "(~p)", [Template]),
-    option(limit(Limit), Options, 10000000000),
-    rpc_page(Template, 0, Limit, GoalAtom, TemplateAtom, Parts, Options).
+    term_variables(Goal, Vars), Template =.. [v|Vars],
+    variable_names(Vars, 0, Names),
+    term_atom(Names, Goal, GA), term_atom(Names, Template, TA),
+    (select_option(limit(Limit), Options, HTTPOptions)
+    -> must_be(positive_integer, Limit), Limits=[limit=Limit]
+    ; HTTPOptions=Options, Limits=[]),
+    rpc_page(Template, 0, GA, TA, Parts, Limits, HTTPOptions).
 
+rpc_page(Template, Offset, GA, TA, Parts, Limits, Options) :-
+    parse_url(ExpandedURI, [path('/call'),
+        search([goal=GA,template=TA,offset=Offset,format=prolog|Limits])|Parts]),
+    setup_call_cleanup(http_open(ExpandedURI, Stream, Options),
+        read_term(Stream, Answer, [double_quotes(chars)]), close(Stream)),
+    portable_term(Answer),
+    rpc_answer(Answer, Template, Offset, GA, TA, Parts, Limits, Options).
 
-rpc_page(Template, Offset, Limit, GoalAtom, TemplateAtom, Parts, Options) :-
-    parse_url(ExpandedURI, [
-        path('/call'),
-        search([goal=GoalAtom, template=TemplateAtom,
-                offset=Offset, limit=Limit, format=prolog])
-      | Parts
-    ]),
-    setup_call_cleanup(
-        http_open(ExpandedURI, Stream, Options),
-        read(Stream, Answer),
-        close(Stream)
-    ),
-    rpc_answer(Answer, Template, Offset, Limit, GoalAtom, TemplateAtom, Parts, Options).
-
-
-rpc_answer(success(Slice, true), Template, Offset, Limit, GoalAtom, TemplateAtom, Parts, Options) :- !,
-    (   member(Template, Slice)
-    ;   NewOffset is Offset + Limit,
-        rpc_page(Template, NewOffset, Limit, GoalAtom, TemplateAtom, Parts, Options)
-    ).
-rpc_answer(success(Slice, false), Template, _, _, _, _, _, _) :-
-    member(Template, Slice).
-rpc_answer(failure, _, _, _, _, _, _, _) :-
-    fail.
-rpc_answer(error(Error), _, _, _, _, _, _, _) :-
-    throw(Error).
+rpc_answer(success(Slice,More), Template, Offset, GA, TA, Parts, Limits, Options) :-
+    is_list(Slice), (More == true; More == false), !,
+    (member(Template, Slice)
+    ; More == true, Slice \== [], length(Slice, Count), Next is Offset+Count,
+      rpc_page(Template, Next, GA, TA, Parts, Limits, Options)).
+rpc_answer(failure, _, _, _, _, _, _, _) :- !, fail.
+rpc_answer(error(E), _, _, _, _, _, _, _) :- !, throw(E).
+rpc_answer(Answer, _, _, _, _, _, _, _) :- domain_error(answer_term, Answer).

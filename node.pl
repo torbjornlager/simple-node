@@ -1,174 +1,105 @@
-:- module(node,
-       [ node/1                  % +Port
-       ]).
+:- module(node, [node/1, stop_node/1, clear_cache/0]).
 
-/** <module> Node -- simple HTTP endpoint for toplevel queries
-
-This module exposes a small HTTP interface for evaluating Prolog goals
-through a toplevel actor. Requests are served by `/call`, with the goal
-and query options passed as HTTP parameters.
-
-For paged queries, a suspended toplevel actor may be cached between
-requests. This allows later calls with the next offset to continue from
-the already running enumeration rather than restarting the goal.
-
-Currently, only the `prolog` response format is implemented. Requests
-for `json` receive a simple "not yet implemented" response.
+/** <module> A local teaching node with request-owned query continuations.
+    This runs trusted code with host authority; it is not a public service.
 */
-
-
-                /*******************************
-                *             NODE             *
-                *******************************/
-
-
-:- use_module(actors, [
-       receive/2,
-       exit/2
-   ]).
-:- use_module(toplevel_actors, [
-       toplevel_spawn/2,
-       toplevel_call/3,
-       toplevel_next/2
-   ]).
-
+:- use_module(actors, []).
+:- use_module(toplevel_actors, [toplevel_spawn/2, toplevel_call/3, toplevel_next/2]).
+:- use_module(term_wire).
 :- use_module(library(http/http_dispatch)).
 :- use_module(library(http/http_parameters)).
 :- use_module(library(http/thread_httpd)).
 :- use_module(library(settings)).
+:- use_module(library(aggregate)).
 
-
-:- setting(cache_size, integer, 100, 'Max number of cache entries').
-:- setting(timeout, number, 100, 'Timeout in seconds').
-
-
+:- setting(cache_size, integer, 100, 'Maximum suspended continuations').
+:- setting(timeout, number, 30, 'Seconds waiting for a page').
+:- dynamic cache/3.
 :- http_handler(root(call), node_controller_http, []).
 
-
-%!  node(+Port) is det.
-%
-%   Start the node HTTP server on Port.
-
-node(Port) :-
-    http_server(http_dispatch, [port(Port)]).
-
-
-%!  compute_answer(+Goal, +Template, +Offset, +Limit, -Answer) is det.
-%
-%   Compute one answer term for Goal using the given Template, Offset,
-%   and Limit. If a suspended toplevel matching the same goal/template
-%   pair is cached at the given offset, continue from that process.
-%   Otherwise start a fresh toplevel for the query.
-%
-%   For a naive implementation that doesn't implement caching,
-%   replace with this:
-%
-%   compute_answer(Goal, Template, Offset, Limit, Answer) :-
-%       once(answer(Goal, Template, Offset, Limit, Answer)).
-
-
-compute_answer(Goal, Template, Offset, Limit, Answer) :-
-    goal_id(Goal-Template, Gid),
-    (   cache_retract(Gid, Offset, Pid)
-    ->  thread_self(Self),
-        toplevel_next(Pid, [
-            limit(Limit),
-            target(Self)
-        ])
-    ;   toplevel_spawn(Pid, [
-            link(false),
-            session(false)
-        ]),
-        toplevel_call(Pid, Goal, [
-            template(Template),
-            offset(Offset),
-            limit(Limit)
-        ])
-    ),
-    setting(timeout, Timeout),
-    receive({
-        success(Pid, Slice, true) ->
-            NextOffset is Offset + Limit,
-            cache_update(Gid, NextOffset, Pid),
-            Answer = success(Slice, true) ;
-        success(Pid, Slice, false) ->
-            Answer = success(Slice, false) ;
-        failure(Pid) ->
-            Answer = failure ;
-        error(Pid, Error) ->
-            Answer = error(Error)
-    }, [
-        timeout(Timeout),
-        on_timeout((
-            Answer = error(timeout),
-            exit(Pid, kill)
-        ))
-    ]).
-
-
-                /*******************************
-                *             HTTP            *
-                *******************************/
-
+node(Port) :- http_server(http_dispatch, [port(localhost:Port)]).
+stop_node(Port) :- http_stop_server(Port, []), clear_cache.
 
 node_controller_http(Request) :-
-    http_parameters(Request, [
-        goal(GoalAtom, [atom]),
-        template(TemplateAtom, [default(GoalAtom)]),
-        offset(Offset, [integer, default(0)]),
-        limit(Limit, [integer, default(10000000000)]),
-        format(Format, [atom, default(json)])
-    ]),
-    atomic_list_concat([GoalAtom, +, TemplateAtom], QTAtom),
-    read_term_from_atom(QTAtom, Goal+Template, []),
-    compute_answer(Goal, Template, Offset, Limit, Answer),
+    http_parameters(Request, [goal(GA,[atom]), template(TA,[atom,default(GA)]),
+        offset(Offset,[integer,default(0)]), limit(Limit,[integer,optional(true)]),
+        format(Format,[atom,default(prolog)])]),
+    catch((must_be(nonneg, Offset),
+           (var(Limit) -> true; must_be(positive_integer, Limit)),
+           parse_goal_template(GA, TA, Goal, Template),
+           compute_answer(Goal, Template, Offset, Limit, Answer)),
+          E, safe_answer(error(E), Answer)),
     respond_with_answer(Format, Answer).
 
+compute_answer(Goal, Template, Offset, Limit, Answer) :-
+    must_be(nonneg, Offset),
+    (var(Limit) -> true; must_be(positive_integer, Limit)),
+    goal_key(Goal-Template, Key),
+    Owner = owner(none, request),
+    setup_call_cleanup(message_queue_create(Queue),
+        setup_call_cleanup(true,
+            query_page(Queue, Owner, Key, Goal, Template, Offset, Limit, Answer),
+            release_owner(Owner)),
+        message_queue_destroy(Queue)).
 
-respond_with_answer(prolog, Answer) :- !,
+query_page(Queue, Owner, Key, Goal, Template, Offset, Limit, Answer) :-
+    (var(Limit) -> Limits=[]; Limits=[limit(Limit)]),
+    sig_atomic((
+        (nonvar(Limit), cache_retract(Key, Offset, Pid) -> Mode=next
+        ; toplevel_spawn(Pid, [link(false),session(false),target(Queue)]), Mode=call),
+        nb_setarg(1, Owner, Pid))),
+    (Mode == next -> toplevel_next(Pid, [target(Queue)|Limits])
+    ; toplevel_call(Pid, user:Goal,
+                   [template(Template),offset(Offset),target(Queue)|Limits])),
+    setting(timeout, Timeout),
+    (thread_get_message(Queue, Message, [timeout(Timeout)])
+    -> page_message(Message, Pid, Candidate)
+    ; Candidate=error(error(resource_error(time),_))),
+    safe_answer(Candidate, Answer),
+    (Answer = success(Slice,true), nonvar(Limit)
+    -> length(Slice, Count), Next is Offset+Count,
+       sig_atomic((cache_update(Key, Next, Pid), nb_setarg(2, Owner, cache)))
+    ; true).
+
+page_message(success(Pid,Slice,More), Expected, success(Slice,More)) :-
+    Pid == Expected, (More == true; More == false), !.
+page_message(failure(Pid), Expected, failure) :- Pid == Expected, !.
+page_message(error(Pid,E), Expected, error(E)) :- Pid == Expected, !.
+page_message(Message, _, error(unexpected_message(Message))).
+
+release_owner(owner(none,_)) :- !.
+release_owner(owner(_,cache)) :- !.
+release_owner(owner(Pid,request)) :- stop_toplevel(Pid).
+
+stop_toplevel(Pid) :-
+    actors:exit(Pid, stopped).
+
+cache_retract(Key, Offset, Pid) :-
+    with_mutex(continuation_cache, once(retract(cache(Key,Offset,Pid)))).
+
+cache_update(Key, Offset, Pid) :-
+    with_mutex(continuation_cache,
+        (assertz(cache(Key,Offset,Pid)), evict_excess(Evicted))),
+    maplist(stop_toplevel, Evicted).
+
+evict_excess(Evicted) :-
+    setting(cache_size, Max), must_be(nonneg, Max),
+    aggregate_all(count, cache(_,_,_), Count),
+    (Count > Max -> once(retract(cache(_,_,Pid))),
+                   Evicted=[Pid|Rest], evict_excess(Rest)
+    ; Evicted=[]).
+
+clear_cache :-
+    sig_atomic((with_mutex(continuation_cache,
+        findall(Pid, retract(cache(_,_,Pid)), Pids)),
+        maplist(stop_toplevel, Pids))).
+
+respond_with_answer(prolog, Candidate) :- !,
+    safe_answer(Candidate, Answer),
+    format('Content-type: application/x-prolog; charset=UTF-8~n~n'),
+    write_term(Answer, [quoted(true),ignore_ops(true),numbervars(false),
+                        fullstop(true),nl(true)]).
+respond_with_answer(json, _) :- !,
     format('Content-type: text/plain; charset=UTF-8~n~n'),
-    write_term(Answer, [
-        quoted(true),
-        ignore_ops(true),
-        fullstop(true),
-        nl(true),
-        blobs(portray)
-    ]).
-respond_with_answer(json, _Answer) :-
-    format('Content-type: text/plain; charset=UTF-8~n~n'),
-    writeln('JSON output is not yet implemented'),
-    writeln('Use format=prolog').
-
-
-
-                /*******************************
-                *            CACHE            *
-                *******************************/
-
-
-:- dynamic cache/3.
-
-
-goal_id(GoalTemplate, Gid) :-
-    copy_term(GoalTemplate, Gid0),
-    numbervars(Gid0, 0, _),
-    term_hash(Gid0, Gid).
-
-
-cache_retract(Gid, Offset, Pid) :-
-    once(retract(cache(Gid, Offset, Pid))).
-
-
-cache_update(Gid, Offset, Pid) :-
-    assertz(cache(Gid, Offset, Pid)),
-    trim_cache.
-
-
-trim_cache :-
-    setting(cache_size, Size),
-    predicate_property(cache(_, _, _), number_of_clauses(Count)),
-    (   Count > Size
-    ->  once(retract(cache(_, _, _))),
-        trim_cache
-    ;   true
-    ).
+    writeln('JSON output is not yet implemented'), writeln('Use format=prolog').
+respond_with_answer(Format, _) :- domain_error(answer_format, Format).

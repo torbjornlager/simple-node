@@ -296,8 +296,8 @@ exit(Reason) :-
     instantiation_error(Reason).
 exit(Reason) :-
     self(Self),
-    asserta(exit_reason(Self, Reason)),
-    abort.
+    (exit_reason(Self, _) -> true
+    ; assertz(exit_reason(Self, Reason)), abort).
 
 
 %!  exit(+Pid, +Reason) is det.
@@ -408,7 +408,8 @@ respond(Pid, Term) :-
 %       Matches only if the message is subsumed by Pattern *and*
 %       Guard succeeds. Guard is a Prolog goal that may refer to
 %       variables in Pattern; it is called deterministically (via
-%       once/1) and any error causes the clause not to match.
+%       once/1) and an ordinary error causes the clause not to match. Control
+%       exceptions propagate to the actor or toplevel handler.
 %
 %   Clauses are tried top-to-bottom against each mailbox message, and
 %   the mailbox is scanned in arrival order.
@@ -463,7 +464,9 @@ respond(Pid, Term) :-
 receive(Clauses) :-
     receive(Clauses, []).
 
-receive(Clauses, Options) :-
+receive(Clauses, Options0) :-
+    strip_module(Clauses, Module, _),
+    maplist(qualify_receive_option(Module), Options0, Options),
     thread_self(Mailbox),
     (   clause(deferred(Msg), true, Ref),
         select_body(Clauses, Msg, Body)
@@ -472,16 +475,47 @@ receive(Clauses, Options) :-
     ;   receive(Mailbox, Clauses, Options)
     ).
 
-receive(Mailbox, Clauses, Options) :-    
-    (   thread_get_message(Mailbox, Msg, Options)
-    ->  (   select_body(Clauses, Msg, Body)
-        ->  call(Body)
-        ;   assertz(deferred(Msg)),
-            receive(Mailbox, Clauses, Options)
-        )
-    ;   option(on_timeout(Goal), Options, true),
-        call(Goal)
+qualify_receive_option(Module, on_timeout(Goal), on_timeout(Qualified)) :- !,
+    qualify_goal(Module, Goal, Qualified).
+qualify_receive_option(_, Option, Option).
+
+receive(Mailbox, Clauses, Options) :-
+    option(timeout(Timeout), Options, infinite),
+    (Timeout == infinite -> Deadline=infinite
+    ; must_be(number, Timeout),
+      (Timeout < 0 -> domain_error(not_less_than_zero, Timeout); true),
+      (Timeout =:= 0 -> Deadline=poll
+      ; get_time(Now), Deadline is Now+Timeout)),
+    scan(Mailbox, Clauses, Deadline, Options).
+
+scan(Mailbox, Clauses, Deadline, Options) :-
+    (   dequeue_deferred(Mailbox, Message, Deadline, Ref)
+    ->  (select_body(Clauses, Message, Body)
+        -> erase(Ref), call(Body)
+        ; scan(Mailbox, Clauses, Deadline, Options))
+    ;   option(on_timeout(Goal), Options, true), call(Goal)
     ).
+
+% Keep the queue-to-deferred handoff atomic, but leave the bounded wait
+% outside it interruptible. Guards always run outside sig_atomic/1.
+dequeue_deferred(Mailbox, Message, poll, Ref) :- !,
+    sig_atomic((thread_peek_message(Mailbox, _),
+                thread_get_message(Mailbox, Message),
+                assertz(deferred(Message), Ref))).
+dequeue_deferred(Mailbox, Message, Deadline, Ref) :-
+    get_time(Now),
+    (Deadline == infinite -> Pause=0.01
+    ; Now < Deadline, Pause is min(0.01,Deadline-Now)),
+    (dequeue_deferred(Mailbox, Message, poll, Ref)
+    -> true
+    ; sleep(Pause), dequeue_deferred(Mailbox, Message, Deadline, Ref)).
+
+control_exception('$abort_goal').
+control_exception('$ptcp_time_limit').
+control_exception(unwind(_)).
+
+guard_exception(E) :- control_exception(E), !, throw(E).
+guard_exception(_) :- fail.
 
     
 select_body(M:{Clauses}, Message, Body) :-
@@ -492,12 +526,12 @@ select_body_aux(M, (Clause ; Clauses), Message, Body) :-
     ;   select_body_aux(M, Clauses, Message, Body)
     ).
 select_body_aux(M, (Head -> Body0), Message, Body) :-
-    (   subsumes_term(if(Pattern, Guard), Head)
+    (   nonvar(Head), Head = if(Pattern, Guard)
     ->  if(Pattern, Guard) = Head,
         subsumes_term(Pattern, Message),
         Pattern = Message,
         qualify_goal(M, Guard, QualifiedGuard),
-        catch(once(QualifiedGuard), _, fail),
+        catch(once(QualifiedGuard), E, guard_exception(E)),
         qualify_goal(M, Body0, Body)
     ;   subsumes_term(Head, Message),
         Head = Message,
